@@ -1,131 +1,67 @@
 import { z } from "zod";
-import { redact } from "./config";
-import { emptyUsage, type Message, type SessionConfig, type ToolCall, type Usage } from "./models";
 
-export type ToolDefinition = { name: string; description: string; input_schema: Record<string, unknown> };
-export type ProviderResponse = { text: string; tool_calls: ToolCall[]; usage: Usage; stop_reason: string; raw: unknown };
-export type StreamDelta = { type: "text" | "tool" | "usage" | "stop"; text?: string; index?: number; id?: string; name?: string; arguments?: string; usage?: Usage; stop_reason?: string };
-const object = z.record(z.string(), z.unknown());
-const openAIResponse = z.object({ choices: z.array(z.object({ message: z.object({ content: z.string().nullable().optional(), tool_calls: z.array(z.object({ id: z.string(), function: z.object({ name: z.string(), arguments: z.string() }) })).optional() }), finish_reason: z.string().nullable() })), usage: z.object({ prompt_tokens: z.number(), completion_tokens: z.number(), total_tokens: z.number() }).optional() });
-const anthropicResponse = z.object({ content: z.array(z.union([z.object({ type: z.literal("text"), text: z.string() }), z.object({ type: z.literal("tool_use"), id: z.string(), name: z.string(), input: object }), z.object({ type: z.string() }).passthrough()])), usage: z.object({ input_tokens: z.number(), output_tokens: z.number() }), stop_reason: z.string().nullable() });
-
-export class ProviderError extends Error {
-  constructor(message: string, public readonly status = 0, public readonly recoverable = false) { super(redact(message)); this.name = "ProviderError"; }
-}
-export async function retryRequest(request: () => Promise<Response>, signal: AbortSignal, attempts = 5, elapsedLimit = 120000): Promise<Response> {
-  const started = Date.now();
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    signal.throwIfAborted();
-    let delay = Math.random() * Math.min(20000, 1000 * 2 ** attempt);
-    try {
-      const response = await request();
-      if (response.ok) return response;
-      const retryable = [408, 409, 429].includes(response.status) || response.status >= 500;
-      const text = (await response.text()).slice(0, 2000);
-      if (!retryable || attempt === attempts - 1) throw new ProviderError(`Model API ${response.status}: ${text}`, response.status, retryable);
-      const header = response.headers.get("retry-after");
-      if (header) { const seconds = Number(header); delay = Math.max(delay, Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(header) - Date.now())); }
-    } catch (error) {
-      if (error instanceof ProviderError || signal.aborted) throw error;
-      if (attempt === attempts - 1) throw new ProviderError(error instanceof Error ? error.message : "Model transport failed", 0, true);
+export const usageSchema = z.object({ input: z.number().int().nonnegative(), output: z.number().int().nonnegative(), total: z.number().int().nonnegative() }).strict();
+export type Usage = z.infer<typeof usageSchema>;
+export const emptyUsage = (): Usage => ({ input: 0, output: 0, total: 0 });
+export const errorSchema = z.object({ type: z.string(), message: z.string(), recoverable: z.boolean(), environment_may_have_advanced: z.boolean() }).strict();
+export type EpisodeError = z.infer<typeof errorSchema>;
+const lineRangeSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]).refine((range) => range[0] <= range[1], { message: "line_range start must not exceed end" });
+export const episodeSubmissionSchema = z.object({
+  summary: z.string().min(1).max(4000),
+  useful_files: z.array(z.object({ path: z.string().min(1).max(1024), role: z.string().max(1000), line_range: lineRangeSchema.optional(), sha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional() }).strict()).max(80),
+  results: z.array(z.object({ key: z.string().max(200), value: z.string().max(4000) }).strict()).max(80),
+  open_questions: z.array(z.string().max(1000)).max(30),
+  next_steps: z.array(z.string().max(1000)).max(30),
+  status: z.enum(["complete", "partial", "failed"]),
+}).strict();
+export const episodeSchema = episodeSubmissionSchema.extend({ episode_id: z.string(), thread_id: z.string(), sequence: z.number().int().positive(), created_at: z.iso.datetime(), requested_action: z.string(), token_usage: usageSchema, duration_ms: z.number().nonnegative(), source_episode_refs: z.array(z.string()), error: errorSchema.optional() }).strict();
+export type Episode = z.infer<typeof episodeSchema>;
+export const policySchema = z.object({ allow: z.array(z.string()).max(30).default([]), deny: z.array(z.string()).max(30).default([]), allow_mutating: z.boolean().default(true), allow_shell: z.boolean().default(false), allow_network: z.boolean().default(false), working_dir: z.string().max(1024).default("."), max_tool_calls: z.number().int().min(1).max(200).default(40) }).strict();
+export type ToolPolicy = z.infer<typeof policySchema>;
+export type ToolPolicyInput = z.input<typeof policySchema>;
+export const threadSchema = z.object({ thread_id: z.string(), name: z.string().min(1).max(80), system_prompt: z.string().min(1).max(16000), created_at: z.iso.datetime(), updated_at: z.iso.datetime(), status: z.enum(["ready", "running", "complete", "failed"]), tags: z.array(z.string().max(40)).max(12), tool_policy: policySchema, episodes: z.array(episodeSchema) }).strict();
+export type Thread = z.infer<typeof threadSchema>;
+export const callSchema = z.object({ call_id: z.string().min(1).max(80), thread_name: z.string().min(1).max(80), create_if_missing: z.boolean().default(true), thread_system_prompt: z.string().max(16000).optional(), requested_action: z.string().min(1).max(24000), source_threads: z.array(z.string()).max(40).default([]), source_episodes: z.array(z.string()).max(100).default([]), depends_on: z.array(z.string()).max(40).default([]), tool_policy: policySchema.optional(), model: z.string().max(100).optional(), max_turns: z.number().int().min(1).max(100).optional(), timeout_sec: z.number().int().min(10).max(1800).optional() }).strict();
+export type ThreadCall = z.infer<typeof callSchema>;
+export type ThreadCallInput = z.input<typeof callSchema>;
+export const batchSchema = z.object({ rationale: z.string().max(4000).default(""), calls: z.array(callSchema).min(1).max(40) }).strict().superRefine((batch, context) => {
+  const ids = new Set<string>();
+  for (const [index, call] of batch.calls.entries()) {
+    if (ids.has(call.call_id)) context.addIssue({ code: "custom", path: ["calls", index, "call_id"], message: `Duplicate call_id ${call.call_id}` });
+    ids.add(call.call_id);
+  }
+  for (const [index, call] of batch.calls.entries()) {
+    for (const dependency of call.depends_on) {
+      if (dependency === call.call_id) context.addIssue({ code: "custom", path: ["calls", index, "depends_on"], message: `Call ${call.call_id} depends on itself` });
+      else if (!ids.has(dependency)) context.addIssue({ code: "custom", path: ["calls", index, "depends_on"], message: `Call ${call.call_id} depends on unknown call ${dependency}` });
     }
-    if (Date.now() - started + delay >= elapsedLimit) throw new ProviderError("Model request retry budget exhausted", 0, true);
-    await new Promise<void>((resolve, reject) => {
-      const abort = (): void => { clearTimeout(timer); reject(signal.reason); };
-      const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, delay);
-      signal.addEventListener("abort", abort, { once: true });
-    });
   }
-  throw new ProviderError("Model request exhausted retries", 0, true);
-}
-function serializeOpenAI(messages: Message[]): Record<string, unknown>[] {
-  return messages.map((message) => ({ role: message.role, content: message.content || null, ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}), ...(message.tool_calls?.length ? { tool_calls: message.tool_calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) } : {}) }));
-}
-function serializeAnthropic(messages: Message[]): { system: string; messages: Record<string, unknown>[] } {
-  const result: { role: string; content: Record<string, unknown>[] }[] = [];
-  for (const message of messages.filter((item) => item.role !== "system")) {
-    const role = message.role === "tool" ? "user" : message.role;
-    const blocks: Record<string, unknown>[] = [];
-    if (message.role === "tool") blocks.push({ type: "tool_result", tool_use_id: message.tool_call_id, content: message.content });
-    else {
-      if (message.content) blocks.push({ type: "text", text: message.content });
-      for (const call of message.tool_calls ?? []) blocks.push({ type: "tool_use", id: call.id, name: call.name, input: call.arguments });
-    }
-    if (!blocks.length) continue;
-    if (result.at(-1)?.role === role) result[result.length - 1].content.push(...blocks);
-    else result.push({ role, content: blocks });
-  }
-  return { system: messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n"), messages: result };
-}
-export abstract class LLMProvider {
-  abstract chat(messages: Message[], tools: ToolDefinition[], model: string, signal: AbortSignal): Promise<ProviderResponse>;
-  abstract stream(messages: Message[], tools: ToolDefinition[], model: string, signal: AbortSignal): AsyncGenerator<StreamDelta>;
-}
-export class HTTPProvider extends LLMProvider {
-  constructor(private readonly config: SessionConfig) { super(); }
-  private async request(messages: Message[], tools: ToolDefinition[], model: string, signal: AbortSignal, stream: boolean): Promise<Response> {
-    const isOpenAI = this.config.provider === "openai";
-    const key = isOpenAI ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY;
-    if (!key) throw new ProviderError(`Configure ${isOpenAI ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"} on the server before starting a run.`, 401);
-    const base = isOpenAI ? (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1") : (process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com/v1");
-    const body = isOpenAI ? { model, messages: serializeOpenAI(messages), temperature: this.config.temperature, max_completion_tokens: this.config.max_tokens, stream, ...(stream ? { stream_options: { include_usage: true } } : {}), ...(tools.length ? { tools: tools.map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.input_schema } })) } : {}) } : { model, ...serializeAnthropic(messages), temperature: this.config.temperature, max_tokens: this.config.max_tokens, stream, ...(tools.length ? { tools } : {}) };
-    const headers: Record<string, string> = { "content-type": "application/json", ...(isOpenAI ? { authorization: `Bearer ${key}` } : { "x-api-key": key, "anthropic-version": "2023-06-01" }) };
-    return retryRequest(() => fetch(`${base.replace(/\/$/, "")}/${isOpenAI ? "chat/completions" : "messages"}`, { method: "POST", headers, body: JSON.stringify(body), signal }), signal);
-  }
-  async chat(messages: Message[], tools: ToolDefinition[], model: string, signal: AbortSignal): Promise<ProviderResponse> {
-    const raw: unknown = await (await this.request(messages, tools, model, signal, false)).json();
-    if (this.config.provider === "openai") {
-      const parsed = openAIResponse.parse(raw);
-      const choice = parsed.choices[0];
-      if (!choice) throw new ProviderError("Model returned no completion");
-      return { text: choice.message.content ?? "", tool_calls: (choice.message.tool_calls ?? []).map((call) => ({ id: call.id, name: call.function.name, arguments: object.parse(JSON.parse(call.function.arguments)) })), usage: parsed.usage ? { input: parsed.usage.prompt_tokens, output: parsed.usage.completion_tokens, total: parsed.usage.total_tokens } : emptyUsage(), stop_reason: choice.finish_reason ?? "unknown", raw };
-    }
-    const parsed = anthropicResponse.parse(raw);
-    const calls: ToolCall[] = [];
-    const texts: string[] = [];
-    for (const block of parsed.content) {
-      if (block.type === "text" && "text" in block && typeof block.text === "string") texts.push(block.text);
-      if (block.type === "tool_use" && "id" in block && typeof block.id === "string" && "name" in block && typeof block.name === "string" && "input" in block) calls.push({ id: block.id, name: block.name, arguments: object.parse(block.input) });
-    }
-    return { text: texts.join("\n"), tool_calls: calls, usage: { input: parsed.usage.input_tokens, output: parsed.usage.output_tokens, total: parsed.usage.input_tokens + parsed.usage.output_tokens }, stop_reason: parsed.stop_reason ?? "unknown", raw };
-  }
-  async *stream(messages: Message[], tools: ToolDefinition[], model: string, signal: AbortSignal): AsyncGenerator<StreamDelta> {
-    const response = await this.request(messages, tools, model, signal, true);
-    if (!response.body) throw new ProviderError("Streaming response has no body");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let inputTokens = 0;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6).trim();
-          if (payload === "[DONE]") return;
-          const data = JSON.parse(payload) as Record<string, unknown>;
-          if (this.config.provider === "openai") {
-            const choices = (data.choices ?? []) as { delta?: { content?: string; tool_calls?: { index: number; id?: string; function?: { name?: string; arguments?: string } }[] }; finish_reason?: string }[];
-            for (const choice of choices) {
-              if (choice.delta?.content) yield { type: "text", text: choice.delta.content };
-              for (const call of choice.delta?.tool_calls ?? []) yield { type: "tool", index: call.index, id: call.id, name: call.function?.name, arguments: call.function?.arguments };
-              if (choice.finish_reason) yield { type: "stop", stop_reason: choice.finish_reason };
-            }
-            if (data.usage) { const usage = data.usage as { prompt_tokens: number; completion_tokens: number; total_tokens: number }; yield { type: "usage", usage: { input: usage.prompt_tokens, output: usage.completion_tokens, total: usage.total_tokens } }; }
-          } else {
-            if (data.type === "error") throw new ProviderError(JSON.stringify(data.error));
-            if (data.type === "message_start") inputTokens = ((data.message as { usage?: { input_tokens: number } }).usage?.input_tokens ?? 0);
-            if (data.type === "content_block_start") { const block = data.content_block as { type: string; id?: string; name?: string }; if (block.type === "tool_use") yield { type: "tool", index: Number(data.index), id: block.id, name: block.name }; }
-            if (data.type === "content_block_delta") { const delta = data.delta as { text?: string; partial_json?: string }; if (delta.text) yield { type: "text", text: delta.text }; if (delta.partial_json) yield { type: "tool", index: Number(data.index), arguments: delta.partial_json }; }
-            if (data.type === "message_delta") { const output = (data.usage as { output_tokens?: number })?.output_tokens ?? 0; yield { type: "usage", usage: { input: inputTokens, output, total: inputTokens + output } }; const reason = (data.delta as { stop_reason?: string }).stop_reason; if (reason) yield { type: "stop", stop_reason: reason }; }
-          }
-        }
-      }
-    } finally { await reader.cancel(); reader.releaseLock(); }
-  }
-}
-export const tokenCount = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 3);
+  const graph = new Map(batch.calls.map((call) => [call.call_id, call.depends_on]));
+  const state = new Map<string, 1 | 2>();
+  const visit = (id: string): boolean => {
+    const mark = state.get(id);
+    if (mark === 2) return false;
+    if (mark === 1) return true;
+    state.set(id, 1);
+    for (const next of graph.get(id) ?? []) if (graph.has(next) && next !== id && visit(next)) return true;
+    state.set(id, 2);
+    return false;
+  };
+  for (const call of batch.calls) if (visit(call.call_id)) { context.addIssue({ code: "custom", path: ["calls"], message: "depends_on contains a cycle" }); break; }
+});
+export type BatchPlan = z.infer<typeof batchSchema>;
+export type CallResult = { call_id: string; thread_name: string; status: "complete" | "partial" | "failed" | "skipped"; episode?: Episode; error?: EpisodeError; failed_dependencies?: string[]; duration_ms: number; token_usage: Usage };
+export type BatchReport = { batch_id: string; rationale: string; started_at: string; finished_at?: string; status: "running" | "complete"; calls: CallResult[]; counts: Record<CallResult["status"], number>; token_usage: Usage; duration_ms: number };
+export type ToolCall = { id: string; name: string; arguments: Record<string, unknown> };
+export type Message = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_calls?: ToolCall[]; tool_call_id?: string };
+export type RunRecord = { run_id: string; prompt: string; started_at: string; finished_at?: string; status: "running" | "complete" | "failed" | "cancelled"; phase: "planning" | "dispatching" | "finished"; model: string; batches: BatchReport[]; token_usage: Usage; final_answer?: string; error?: EpisodeError; cancel_requested: boolean; heartbeat_at: string };
+export type SteeringItem = { id: string; text: string; thread_name?: string; queued_at: string; consumed_at?: string; consumption_point?: string };
+export type RuntimeEvent = { id: string; type: string; message: string; created_at: string; session_id: string; run_id?: string; batch_id?: string; call_id?: string; thread_id?: string; episode_id?: string; details?: Record<string, unknown> };
+export const sessionConfigSchema = z.object({ provider: z.enum(["openai", "anthropic"]).default("openai"), worker_model: z.string().min(1).max(100).default("gpt-4.1-mini"), orchestrator_model: z.string().min(1).max(100).default("gpt-4.1-mini"), max_parallel: z.number().int().min(1).max(12).default(4), max_turns: z.number().int().min(1).max(100).default(24), max_tool_calls: z.number().int().min(1).max(200).default(40), timeout_sec: z.number().int().min(10).max(1800).default(300), context_budget: z.number().int().min(4000).max(200000).default(48000), source_episode_limit: z.number().int().nonnegative().default(0), temperature: z.number().min(0).max(1).default(0.2), max_tokens: z.number().int().min(256).max(16384).default(4096) }).strict();
+export type SessionConfig = z.infer<typeof sessionConfigSchema>;
+export type SessionConfigInput = z.input<typeof sessionConfigSchema>;
+export type SessionData = { threads: Thread[]; runs: RunRecord[]; steering: SteeringItem[]; messages: Message[]; events: RuntimeEvent[]; config: SessionConfig; description: string };
+export type Session = { id: string; name: string; created_at: string; updated_at: string; data: SessionData };
+export type WorkspaceSnapshot = { sessions: Session[]; providers: { openai: boolean; anthropic: boolean }; workspace: string };
+export const jsonSchema = (schema: z.ZodType): Record<string, unknown> => z.toJSONSchema(schema, { io: "input" }) as Record<string, unknown>;
+export function addUsage(a: Usage, b: Usage): Usage { return { input: a.input + b.input, output: a.output + b.output, total: a.total + b.total }; }
